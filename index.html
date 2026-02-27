@@ -53,7 +53,7 @@ Docs:
 ===================================== */
 
 const WEBHOOK_ID = "8ff7ce1b-b595-49b0-b8f9-5f81b287b6a7";
-const BASE = `https://winter-firefly-e33b.seanmatias1962.workers.dev/`;
+const BASE = `https://winter-firefly-e33b.seanmatias1962.workers.dev/bp`;
 
 // UI
 const timerEl = document.getElementById("timer");
@@ -96,9 +96,21 @@ function speak(text){
 
 // --- Chat API calls ---
 async function createUser(){
-  const res = await fetch(`${BASE}/users`, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({}) });
-  if(!res.ok) throw new Error("createUser failed");
-  const data = await res.json();
+  const res = await fetch(`${BASE}/users`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({})
+  });
+
+  const text = await res.text(); // read raw text first
+  if (!res.ok) {
+    throw new Error(`createUser failed (${res.status}): ${text.slice(0,200)}`);
+  }
+
+  // Some APIs return empty bodies on error; guard JSON parse
+  if (!text.trim()) throw new Error("createUser returned empty body");
+  const data = JSON.parse(text);
+
   return data.key || data.userKey || data.user?.key;
 }
 
