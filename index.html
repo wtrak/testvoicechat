@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Oliwia Super Agent — Voice Call</title>
+  <style>
+    :root { --bg:#f6f7f8; --card:#fff; --border:#e6e8eb; --text:#111827; --muted:#6b7280; --primary:#111827; --danger:#dc2626; }
+    body { margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--text); }
+    .wrap { max-width:520px; margin:0 auto; padding:24px; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:18px; box-shadow: 0 6px 18px rgba(0,0,0,.04); }
+    .title { font-size:18px; font-weight:700; margin:0 0 6px; }
+    .sub { margin:0 0 18px; color:var(--muted); }
+    .timer { font-size:44px; font-weight:800; letter-spacing:1px; margin:14px 0 6px; }
+    .status { color:#2b2f36; margin:0 0 16px; }
+    .row { display:flex; gap:10px; }
+    button { flex:1; padding:12px 14px; border-radius:12px; border:1px solid #d7dbe0; background:#fff; font-weight:700; cursor:pointer; }
+    button.primary { background:var(--primary); color:#fff; border-color:var(--primary); }
+    button.danger { background:var(--danger); color:#fff; border-color:var(--danger); }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .hint { margin-top:12px; font-size:12px; color:var(--muted); line-height:1.35; }
+    .small { font-size:12px; color:var(--muted); margin-top:8px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <p class="title">Oliwia Super Agent</p>
+      <p class="sub">Voice consultation (web)</p>
+
+      <div class="timer" id="timer">00:00</div>
+      <p class="status" id="status">Ready.</p>
+
+      <div class="row">
+        <button class="primary" id="startBtn">Start Call</button>
+        <button class="danger" id="hangBtn" disabled>Hang Up</button>
+      </div>
+
+      <div class="hint">
+        Works best in Chrome/Edge. Mic requires HTTPS (GitHub Pages is HTTPS). This prototype uses browser voice.
+        Later you can swap TTS to ElevenLabs by replacing the <b>speak()</b> function only.
+      </div>
+      <div class="small" id="debug"></div>
+    </div>
+  </div>
+
+<script>
+/* ========= Botpress Chat API =========
+Docs:
+- Chat API intro & webhook ID usage :contentReference[oaicite:2]{index=2}
+- listMessages headers (x-user-key) :contentReference[oaicite:3]{index=3}
+- listenConversation SSE endpoint :contentReference[oaicite:4]{index=4}
+===================================== */
+
+const WEBHOOK_ID = "8ff7ce1b-b595-49b0-b8f9-5f81b287b6a7";
+const BASE = `https://chat.botpress.cloud/${WEBHOOK_ID}`;
+
+// UI
+const timerEl = document.getElementById("timer");
+const statusEl = document.getElementById("status");
+const debugEl  = document.getElementById("debug");
+const startBtn = document.getElementById("startBtn");
+const hangBtn  = document.getElementById("hangBtn");
+
+function setStatus(t){ statusEl.textContent = t; }
+function setDebug(t){ debugEl.textContent = t || ""; }
+function fmtTime(ms){
+  const s = Math.floor(ms/1000), m = Math.floor(s/60), r = s%60;
+  return String(m).padStart(2,'0') + ":" + String(r).padStart(2,'0');
+}
+
+let callOn=false, startedAt=null, timerInt=null;
+let userKey=null, conversationId=null;
+let abortListen=null;
+
+// Browser voice
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const canSTT = !!SpeechRecognition;
+const synth = window.speechSynthesis;
+
+function pickVoice() {
+  const voices = synth?.getVoices?.() || [];
+  return voices.find(v => /Google|Samantha|Daniel|Karen|Moira/i.test(v.name)) || voices[0] || null;
+}
+function speak(text){
+  return new Promise(resolve=>{
+    if(!synth) return resolve();
+    synth.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    const v = pickVoice(); if(v) u.voice = v;
+    u.rate = 0.98; u.pitch = 1.0;
+    u.onend = resolve; u.onerror = resolve;
+    synth.speak(u);
+  });
+}
+
+// --- Chat API calls ---
+async function createUser(){
+  const res = await fetch(`${BASE}/users`, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({}) });
+  if(!res.ok) throw new Error("createUser failed");
+  const data = await res.json();
+  return data.key || data.userKey || data.user?.key;
+}
+
+async function createConversation(){
+  const res = await fetch(`${BASE}/conversations`, { method:"POST", headers:{ "Content-Type":"application/json", "x-user-key": userKey }, body: JSON.stringify({}) });
+  if(!res.ok) throw new Error("createConversation failed");
+  const data = await res.json();
+  return data.conversation?.id || data.id;
+}
+
+async function sendMessage(text){
+  const res = await fetch(`${BASE}/messages`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json", "x-user-key": userKey },
+    body: JSON.stringify({ conversationId, payload:{ type:"text", text } })
+  });
+  if(!res.ok) throw new Error("sendMessage failed");
+}
+
+// --- Live listening (SSE) using fetch streaming, so we CAN send x-user-key header ---
+async function listenConversation(onBotText){
+  // Docs endpoint: GET /conversations/{id}/listen :contentReference[oaicite:5]{index=5}
+  const ctrl = new AbortController();
+  abortListen = () => ctrl.abort();
+
+  const res = await fetch(`${BASE}/conversations/${encodeURIComponent(conversationId)}/listen`, {
+    method: "GET",
+    headers: { "x-user-key": userKey },
+    signal: ctrl.signal
+  });
+  if(!res.ok) throw new Error("listenConversation failed");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+
+  while(callOn){
+    const { value, done } = await reader.read();
+    if(done) break;
+    buf += decoder.decode(value, { stream:true });
+
+    // Parse SSE frames separated by blank line
+    const frames = buf.split("\n\n");
+    buf = frames.pop() || "";
+
+    for(const frame of frames){
+      // SSE payload often contains "data: {json}"
+      const dataLine = frame.split("\n").find(l => l.startsWith("data:"));
+      if(!dataLine) continue;
+      const jsonStr = dataLine.replace(/^data:\s?/, "").trim();
+      if(!jsonStr) continue;
+
+      try{
+        const evt = JSON.parse(jsonStr);
+        const text = evt?.message?.payload?.text || evt?.payload?.text;
+        const direction = evt?.message?.direction || evt?.direction; // usually incoming/outgoing
+        const isBot = direction === "outgoing";
+        if(isBot && typeof text === "string" && text.trim()){
+          onBotText(text.trim());
+        }
+      } catch {}
+    }
+  }
+}
+
+// --- Hands-free mic loop (listen, send, wait for bot, repeat) ---
+let rec = null;
+let waitingForBot = false;
+
+function listenOnce(){
+  if(!canSTT){ setStatus("Voice input not supported. Use Chrome/Edge."); return; }
+  synth?.cancel?.(); // barge-in friendly
+
+  rec = new SpeechRecognition();
+  rec.lang = "en-US";
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+
+  setStatus("Listening…");
+
+  rec.onresult = async (e) => {
+    const text = e.results[0][0].transcript.trim();
+    if(!text) return;
+    setStatus("Thinking…");
+    waitingForBot = true;
+    await sendMessage(text);
+    // we restart listening after bot speaks (see onBotText handler)
+  };
+
+  rec.onerror = async () => {
+    setStatus("Didn’t catch that. Try again.");
+    if(callOn) setTimeout(listenOnce, 450);
+  };
+
+  rec.onend = () => { /* we'll restart after bot reply */ };
+
+  rec.start();
+}
+
+// --- Call controls ---
+function startTimer(){
+  startedAt = Date.now();
+  timerEl.textContent = "00:00";
+  timerInt = setInterval(()=> timerEl.textContent = fmtTime(Date.now()-startedAt), 250);
+}
+function stopTimer(){ clearInterval(timerInt); timerInt=null; }
+
+async function startCall(){
+  callOn = true;
+  startBtn.disabled = true;
+  hangBtn.disabled = false;
+  setDebug("");
+  startTimer();
+
+  setStatus("Connecting…");
+  userKey = await createUser();
+  conversationId = await createConversation();
+
+  // Start listening stream first
+  listenConversation(async (botText) => {
+    // Keep it “call-like”
+    const trimmed = botText.replace(/\s+/g," ").slice(0, 500);
+
+    setStatus("Speaking…");
+    await speak(trimmed);
+
+    // Loop back to listening after bot finishes
+    if(callOn){
+      setStatus("Listening…");
+      waitingForBot = false;
+      listenOnce();
+    }
+  }).catch(err=>{
+    console.error(err);
+    setDebug("Listen stream error. Check console.");
+    setStatus("Connection issue.");
+  });
+
+  await speak("Hi, you're connected. What can I help you with today?");
+  listenOnce();
+}
+
+function hangUp(){
+  callOn = false;
+  startBtn.disabled = false;
+  hangBtn.disabled = true;
+  setStatus("Call ended.");
+  stopTimer();
+  synth?.cancel?.();
+  try { rec?.stop?.(); } catch {}
+  try { abortListen?.(); } catch {}
+  abortListen = null;
+  userKey = null;
+  conversationId = null;
+}
+
+startBtn.onclick = () => startCall().catch(err=>{
+  console.error(err);
+  setStatus("Could not connect. Check webhook ID.");
+  setDebug(String(err?.message || err));
+  hangUp();
+});
+hangBtn.onclick = hangUp;
+
+if (synth && synth.onvoiceschanged !== undefined) {
+  synth.onvoiceschanged = () => pickVoice();
+}
+</script>
+</body>
+</html>
