@@ -5,22 +5,44 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Oliwia Super Agent — Voice Call</title>
   <style>
-    :root { --bg:#f6f7f8; --card:#fff; --border:#e6e8eb; --text:#111827; --muted:#6b7280; --primary:#111827; --danger:#dc2626; }
-    body { margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--text); }
-    .wrap { max-width:520px; margin:0 auto; padding:24px; }
-    .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:18px; box-shadow: 0 6px 18px rgba(0,0,0,.04); }
-    .title { font-size:18px; font-weight:700; margin:0 0 6px; }
-    .sub { margin:0 0 18px; color:var(--muted); }
-    .timer { font-size:44px; font-weight:800; letter-spacing:1px; margin:14px 0 6px; }
-    .status { color:#2b2f36; margin:0 0 16px; }
-    .row { display:flex; gap:10px; }
-    button { flex:1; padding:12px 14px; border-radius:12px; border:1px solid #d7dbe0; background:#fff; font-weight:700; cursor:pointer; }
-    button.primary { background:var(--primary); color:#fff; border-color:var(--primary); }
-    button.danger { background:var(--danger); color:#fff; border-color:var(--danger); }
-    button:disabled { opacity:.55; cursor:not-allowed; }
-    .hint { margin-top:12px; font-size:12px; color:var(--muted); line-height:1.35; }
-    .small { font-size:12px; color:var(--muted); margin-top:8px; white-space:pre-wrap; }
+    :root{
+      --bg:#f6f7f8; --card:#fff; --border:#e6e8eb; --text:#111827;
+      --muted:#6b7280; --primary:#111827; --danger:#dc2626;
+    }
+    body{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--text); }
+    .wrap{ max-width:520px; margin:0 auto; padding:24px; }
+    .card{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:18px; box-shadow:0 6px 18px rgba(0,0,0,.04); }
+    .title{ font-size:18px; font-weight:700; margin:0 0 6px; }
+    .sub{ margin:0 0 18px; color:var(--muted); }
+    .timer{ font-size:44px; font-weight:800; letter-spacing:1px; margin:14px 0 6px; }
+    .status{ color:#2b2f36; margin:0 0 10px; }
+    .microw{ display:flex; align-items:center; gap:10px; margin:0 0 16px; color:var(--muted); font-size:12px; }
+    .dot{
+      width:10px; height:10px; border-radius:999px; background:#cbd5e1;
+      box-shadow:0 0 0 0 rgba(17,24,39,.25);
+    }
+    .dot.listening{ background:#22c55e; animation:pulse 1.2s infinite; }
+    .dot.thinking{ background:#f59e0b; animation:pulse 1.2s infinite; }
+    .dot.speaking{ background:#3b82f6; animation:pulse 1.2s infinite; }
+    @keyframes pulse{
+      0%{ box-shadow:0 0 0 0 rgba(17,24,39,.18); }
+      70%{ box-shadow:0 0 0 10px rgba(17,24,39,0); }
+      100%{ box-shadow:0 0 0 0 rgba(17,24,39,0); }
+    }
+    .row{ display:flex; gap:10px; }
+    button{ flex:1; padding:12px 14px; border-radius:12px; border:1px solid #d7dbe0; background:#fff; font-weight:700; cursor:pointer; }
+    button.primary{ background:var(--primary); color:#fff; border-color:var(--primary); }
+    button.danger{ background:var(--danger); color:#fff; border-color:var(--danger); }
+    button:disabled{ opacity:.55; cursor:not-allowed; }
+    .hint{ margin-top:12px; font-size:12px; color:var(--muted); line-height:1.35; }
+    .small{ font-size:12px; color:var(--muted); margin-top:8px; white-space:pre-wrap; }
+
+    /* Hide any Botpress webchat UI entirely */
+    #bp-webchat, .bpw-widget-btn, .bpw-widget-container, .bpw-layout, .bpw-chat-container { display:none !important; }
   </style>
+
+  <!-- Botpress Webchat runtime -->
+  <script src="https://cdn.botpress.cloud/webchat/v3.6/inject.js"></script>
 </head>
 <body>
   <div class="wrap">
@@ -31,310 +53,347 @@
       <div class="timer" id="timer">00:00</div>
       <p class="status" id="status">Ready.</p>
 
+      <div class="microw">
+        <div class="dot" id="dot"></div>
+        <div id="miclabel">Idle</div>
+      </div>
+
       <div class="row">
         <button class="primary" id="startBtn">Start Call</button>
         <button class="danger" id="hangBtn" disabled>Hang Up</button>
       </div>
 
       <div class="hint">
-        Works best in Chrome/Edge. Mic requires HTTPS (GitHub Pages is HTTPS). This prototype uses browser voice.
-        Later you can swap TTS to ElevenLabs by replacing the <b>speak()</b> function only.
+        Best in Chrome/Edge. Mic requires HTTPS (GitHub Pages is HTTPS). This uses Botpress Webchat hidden in the background
+        and speaks responses aloud. If replies feel slow, that’s model latency—this UI shows “Thinking…” while waiting.
       </div>
+
       <div class="small" id="debug"></div>
     </div>
   </div>
 
 <script>
-/**
- * Voice-only “phone call” UI + Botpress brain.
- * Uses your Cloudflare Worker proxy (BASE) to avoid CORS issues.
- * Uses polling to fetch bot replies (more reliable than SSE through proxies).
- */
+/** =======================
+ *  CONFIG
+ *  ======================= */
+const CONFIG_URL = "https://files.bpcontent.cloud/2026/02/27/04/20260227040015-FOQXNUVC.json";
 
-const BASE = "https://winter-firefly-e33b.seanmatias1962.workers.dev/bp";
+// “Feels faster” defaults
+const MAX_BOT_SPOKEN_CHARS = 700;        // keep replies short in speech
+const BOT_REPLY_TIMEOUT_MS = 30000;      // how long to wait for a reply before prompting retry
 
-// UI
-const timerEl = document.getElementById("timer");
+/** =======================
+ *  UI helpers
+ *  ======================= */
+const timerEl  = document.getElementById("timer");
 const statusEl = document.getElementById("status");
 const debugEl  = document.getElementById("debug");
 const startBtn = document.getElementById("startBtn");
 const hangBtn  = document.getElementById("hangBtn");
+const dotEl    = document.getElementById("dot");
+const micLabel = document.getElementById("miclabel");
 
-function setStatus(t){ statusEl.textContent = t; }
 function setDebug(t){ debugEl.textContent = t || ""; }
-function fmtTime(ms){
-  const s = Math.floor(ms/1000), m = Math.floor(s/60), r = s%60;
-  return String(m).padStart(2,'0') + ":" + String(r).padStart(2,'0');
-}
-
-// Lightweight logger (prints + shows last line in UI)
-function log(...args) {
+function log(...args){
   try { console.log("[VOICE]", ...args); } catch {}
-  const msg = args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+  const msg = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
   setDebug(msg);
 }
+function fmtTime(ms){
+  const s = Math.floor(ms/1000), m = Math.floor(s/60), r = s%60;
+  return String(m).padStart(2,"0") + ":" + String(r).padStart(2,"0");
+}
+function setState(state, statusText){
+  dotEl.className = "dot" + (state ? " " + state : "");
+  micLabel.textContent = state ? state.toUpperCase() : "IDLE";
+  statusEl.textContent = statusText || (state ? state[0].toUpperCase() + state.slice(1) + "…" : "Ready.");
+}
 
-let callOn=false, startedAt=null, timerInt=null;
-let userKey=null, conversationId=null;
-let rec = null;
-let lastSeenMessageId = null;
+/** =======================
+ *  Call timer
+ *  ======================= */
+let callOn = false;
+let timerInt = null;
+let startedAt = null;
+function startTimer(){
+  startedAt = Date.now();
+  timerEl.textContent = "00:00";
+  timerInt = setInterval(() => timerEl.textContent = fmtTime(Date.now() - startedAt), 250);
+}
+function stopTimer(){ clearInterval(timerInt); timerInt = null; }
 
-// Browser voice
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-const canSTT = !!SpeechRecognition;
+/** =======================
+ *  Browser TTS (free)
+ *  ======================= */
 const synth = window.speechSynthesis;
 
-function pickVoice() {
+function pickVoice(){
   const voices = synth?.getVoices?.() || [];
+  // Prefer high-quality common voices if available
   return voices.find(v => /Google|Samantha|Daniel|Karen|Moira/i.test(v.name)) || voices[0] || null;
 }
-function speak(text){
-  return new Promise(resolve=>{
-    if(!synth) return resolve();
+
+// Improves pronunciation for your use-case
+function normalizeForSpeech(t){
+  if (!t) return t;
+  // Oliwia pronunciation hint: “oh-LIV-ee-ah” or “Olivia” equivalent
+  // (We can’t force exact phonemes reliably across all voices, but this helps.)
+  return t
+    .replace(/\bOliwia\b/g, "Olivia") // makes most English voices say it right
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function speak(text){
+  return new Promise(resolve => {
+    if (!synth) return resolve();
     synth.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    const v = pickVoice(); if(v) u.voice = v;
-    u.rate = 0.98; u.pitch = 1.0;
-    u.onend = resolve; u.onerror = resolve;
+    const u = new SpeechSynthesisUtterance(normalizeForSpeech(text));
+    const v = pickVoice();
+    if (v) u.voice = v;
+    u.rate = 0.98;
+    u.pitch = 1.0;
+    u.onend = resolve;
+    u.onerror = resolve;
     synth.speak(u);
   });
 }
 
-// --- Chat API calls (via Worker proxy) ---
-async function createUser(){
-  log("createUser →", `${BASE}/users`);
+/** =======================
+ *  Browser STT (free)
+ *  ======================= */
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const canSTT = !!SpeechRecognition;
+let rec = null;
 
-  const res = await fetch(`${BASE}/users`, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({})
+/** =======================
+ *  Botpress hidden runtime
+ *  ======================= */
+let bpReady = false;
+let waitingForBot = false;
+let lastUserUtteranceAt = 0;
+
+// We’ll treat any bot message event we can detect as “reply”
+let awaitingReplyResolver = null;
+let awaitingReplyTimer = null;
+
+function waitForBotReply(){
+  return new Promise((resolve) => {
+    awaitingReplyResolver = resolve;
+    clearTimeout(awaitingReplyTimer);
+    awaitingReplyTimer = setTimeout(() => {
+      awaitingReplyResolver = null;
+      resolve(null);
+    }, BOT_REPLY_TIMEOUT_MS);
+  });
+}
+
+function resolveBotReply(text){
+  if (!awaitingReplyResolver) return;
+  clearTimeout(awaitingReplyTimer);
+  const r = awaitingReplyResolver;
+  awaitingReplyResolver = null;
+  r(text);
+}
+
+/**
+ * Botpress Webchat posts messages to window. The exact shape varies.
+ * We aggressively extract any plausible bot text payload.
+ */
+function extractBotTextFromPostMessage(evtData){
+  if (!evtData || typeof evtData !== "object") return null;
+
+  // Common candidates across versions:
+  const candidates = [
+    evtData?.payload?.text,
+    evtData?.payload?.message?.text,
+    evtData?.data?.message?.payload?.text,
+    evtData?.message?.payload?.text,
+    evtData?.data?.payload?.text
+  ];
+
+  const text = candidates.find(x => typeof x === "string" && x.trim());
+  return text ? text.trim() : null;
+}
+
+/**
+ * Heuristic to decide “is this likely a bot message?”
+ * (Since we hide UI, we only need a reliable-ish signal.)
+ */
+function isLikelyBotMessage(evtData){
+  const s = JSON.stringify(evtData);
+  // Try common markers. If your bot also sends these for user, we still gate on timing.
+  if (/outgoing/i.test(s)) return true;
+  if (/(bot|assistant)/i.test(s)) return true;
+  if (/message/i.test(s) && /payload/i.test(s)) return true;
+  return false;
+}
+
+function initHiddenBotpress(){
+  if (!window.botpressWebChat) return false;
+
+  window.botpressWebChat.init({ configUrl: CONFIG_URL });
+
+  // Ensure widget stays hidden if it tries to show
+  try { window.botpressWebChat.sendEvent({ type: "hide" }); } catch {}
+
+  // Listen for webchat events via postMessage
+  window.addEventListener("message", async (event) => {
+    if (!callOn) return;
+
+    const text = extractBotTextFromPostMessage(event.data);
+    if (!text) return;
+
+    // Gate to avoid accidentally reading back our own user utterance echoes:
+    // Only accept as bot reply if:
+    // - we are currently waiting for a bot reply, AND
+    // - the message happens after the last user utterance timestamp, AND
+    // - it looks bot-ish enough
+    if (!waitingForBot) return;
+    const now = Date.now();
+    if (now - lastUserUtteranceAt < 150) return; // too fast; likely echo/noise
+
+    // If it’s not bot-ish, still allow it after a bit (some versions don’t tag well)
+    const botish = isLikelyBotMessage(event.data);
+    if (!botish && (now - lastUserUtteranceAt) < 600) return;
+
+    resolveBotReply(text);
   });
 
-  log("createUser status", res.status);
-
-  // Try body first
-  const raw = await res.text();
-  if (!res.ok) throw new Error(`createUser failed (${res.status}): ${raw.slice(0,200)}`);
-
-  if (raw.trim()) {
-    const data = JSON.parse(raw);
-    const key = data.key || data.userKey || data.user?.key || data.user?.id || data.id;
-    if (key) return key;
-  }
-
-  // Fallback: try headers
-  const headerKey =
-    res.headers.get("x-user-key") ||
-    res.headers.get("X-User-Key") ||
-    res.headers.get("bp-user-key") ||
-    res.headers.get("BP-User-Key");
-
-  if (headerKey) return headerKey;
-
-  // If still nothing, show headers to debug
-  const headersObj = {};
-  for (const [k,v] of res.headers.entries()) headersObj[k] = v;
-  setDebug("createUser empty body; headers: " + JSON.stringify(headersObj, null, 2));
-  throw new Error("createUser: no key returned (body empty; no header key)");
+  bpReady = true;
+  log("Botpress hidden runtime ready");
+  return true;
 }
 
-async function createConversation(){
-  log("createConversation →", `${BASE}/conversations`);
-  const res = await fetch(`${BASE}/conversations`, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json", "x-user-key": userKey },
-    body: JSON.stringify({})
-  });
+// Wait for inject.js to be ready
+(function waitBP(){
+  if (initHiddenBotpress()) return;
+  setTimeout(waitBP, 200);
+})();
 
-  const raw = await res.text();
-  log("createConversation status", res.status);
-
-  if (!res.ok) throw new Error(`createConversation failed (${res.status}): ${raw.slice(0,200)}`);
-  if (!raw.trim()) throw new Error("createConversation returned empty body");
-
-  const data = JSON.parse(raw);
-  const id = data.conversation?.id || data.id;
-  if (!id) throw new Error("createConversation: no conversation id returned");
-  return id;
-}
-
-async function sendMessage(text){
-  log("sendMessage →", text);
-  const res = await fetch(`${BASE}/messages`, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json", "x-user-key": userKey },
-    body: JSON.stringify({ conversationId, payload:{ type:"text", text } })
-  });
-
-  const raw = await res.text();
-  log("sendMessage status", res.status);
-
-  if(!res.ok) throw new Error(`sendMessage failed (${res.status}): ${raw.slice(0,200)}`);
-}
-
-async function listMessages(){
-  const url = `${BASE}/messages?conversationId=${encodeURIComponent(conversationId)}`;
-  const res = await fetch(url, { method:"GET", headers:{ "x-user-key": userKey } });
-
-  const raw = await res.text();
-  if (!res.ok) throw new Error(`listMessages failed (${res.status}): ${raw.slice(0,200)}`);
-  if (!raw.trim()) return [];
-
-  const data = JSON.parse(raw);
-  const msgs = data.messages || data.items || data;
-  return Array.isArray(msgs) ? msgs : [];
-}
-
-function normalizeMessage(m) {
-  const id = m.id || m.message?.id || null;
-  const direction = (m.direction || m.message?.direction || "").toLowerCase();
-  const payload = m.payload || m.message?.payload || {};
-  const text = payload.text || payload?.message?.text || null;
-  const createdAt = m.createdAt || m.message?.createdAt || 0;
-  return { id, direction, text, createdAt };
-}
-
-async function primeLastSeen(){
-  try {
-    const msgs = await listMessages();
-    if (!msgs.length) return;
-    const ordered = msgs.map(normalizeMessage).sort((a,b)=> (a.createdAt||0)-(b.createdAt||0));
-    const last = ordered[ordered.length - 1];
-    lastSeenMessageId = last?.id || null;
-  } catch {}
-}
-
-async function waitForBotReply(timeoutMs = 15000) {
-  const start = Date.now();
-
-  while (Date.now() - start < timeoutMs && callOn) {
-    const msgsRaw = await listMessages();
-    const msgs = msgsRaw.map(normalizeMessage);
-
-    // oldest -> newest
-    msgs.sort((a,b)=> (a.createdAt||0) - (b.createdAt||0));
-
-    // newest outgoing not yet spoken
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      if (!m.id || !m.text) continue;
-
-      const isBot = m.direction === "outgoing";
-      const isNew = lastSeenMessageId !== m.id;
-
-      if (isBot && isNew) {
-        lastSeenMessageId = m.id;
-        return String(m.text).trim();
-      }
-    }
-
-    await new Promise(r => setTimeout(r, 700));
-  }
-  return null;
-}
-
-// --- One-turn mic listen (then we speak, then listen again) ---
-function listenOnce(){
-  if(!canSTT){
-    setStatus("Voice input not supported. Use Chrome/Edge.");
+/** =======================
+ *  Voice loop
+ *  ======================= */
+async function listenOnce(){
+  if (!canSTT){
+    setState("", "Voice input not supported. Use Chrome/Edge.");
     return;
   }
 
-  synth?.cancel?.(); // barge-in friendly
+  // Barge-in: if user starts speaking, stop TTS
+  try { synth?.cancel?.(); } catch {}
 
   rec = new SpeechRecognition();
   rec.lang = "en-US";
   rec.interimResults = false;
   rec.maxAlternatives = 1;
 
-  setStatus("Listening…");
+  setState("listening", "Listening…");
 
   rec.onresult = async (e) => {
-    const text = e.results[0][0].transcript.trim();
-    if(!text) return;
+    const userText = (e.results?.[0]?.[0]?.transcript || "").trim();
+    if (!userText) {
+      if (callOn) setTimeout(listenOnce, 250);
+      return;
+    }
 
     try {
-      setStatus("Thinking…");
-      await sendMessage(text);
+      setState("thinking", "Thinking…");
+      log("you →", userText);
 
-      const reply = await waitForBotReply();
-      if (reply) {
-        const trimmed = reply.replace(/\s+/g," ").slice(0, 500);
-        setStatus("Speaking…");
-        await speak(trimmed);
-      } else {
-        setStatus("No response. Try again.");
-        await speak("Sorry, I didn't get a response. Please try again.");
+      lastUserUtteranceAt = Date.now();
+      waitingForBot = true;
+
+      // Send text to bot
+      window.botpressWebChat.sendPayload({ type: "text", text: userText });
+
+      // Wait for bot reply
+      const botText = await waitForBotReply();
+      waitingForBot = false;
+
+      if (!callOn) return;
+
+      if (!botText) {
+        setState("", "No response. Try again.");
+        await speak("Sorry, I didn’t get a response. Please try again.");
+        return listenOnce();
       }
+
+      const spoken = botText.replace(/\s+/g, " ").trim().slice(0, MAX_BOT_SPOKEN_CHARS);
+      log("bot →", spoken);
+
+      setState("speaking", "Speaking…");
+      await speak(spoken);
+
+      // Back to listening
+      if (callOn) return listenOnce();
     } catch (err) {
       console.error(err);
-      setStatus("Connection issue.");
+      waitingForBot = false;
+      setState("", "Connection issue.");
       setDebug(String(err?.message || err));
       await speak("Sorry, there was a connection issue.");
-    } finally {
-      if (callOn) {
-        setStatus("Listening…");
-        listenOnce();
-      }
+      if (callOn) return listenOnce();
     }
   };
 
-  rec.onerror = async () => {
-    setStatus("Didn’t catch that. Try again.");
-    if(callOn) setTimeout(listenOnce, 450);
+  rec.onerror = () => {
+    setState("", "Didn’t catch that. Try again.");
+    if (callOn) setTimeout(listenOnce, 400);
   };
 
-  rec.onend = () => { /* loop controlled by finally */ };
+  rec.onend = () => {
+    // If it ends without result, restart if call is still on and we're not waiting on bot
+    if (callOn && !waitingForBot) setTimeout(listenOnce, 250);
+  };
 
   rec.start();
 }
 
-// --- Call controls ---
-function startTimer(){
-  startedAt = Date.now();
-  timerEl.textContent = "00:00";
-  timerInt = setInterval(()=> timerEl.textContent = fmtTime(Date.now()-startedAt), 250);
-}
-function stopTimer(){ clearInterval(timerInt); timerInt=null; }
-
+/** =======================
+ *  Call controls
+ *  ======================= */
 async function startCall(){
+  if (!bpReady){
+    setState("thinking", "Loading agent…");
+    await new Promise(r => setTimeout(r, 700));
+  }
+
   callOn = true;
   startBtn.disabled = true;
   hangBtn.disabled = false;
   setDebug("");
+
   startTimer();
 
-  try {
-    setStatus("Connecting…");
-    userKey = await createUser();
-    conversationId = await createConversation();
-    await primeLastSeen();
-
-    await speak("Hi, you're connected. What can I help you with today?");
-    listenOnce();
-  } catch (err) {
-    console.error(err);
-    setStatus("Could not connect.");
-    setDebug(String(err?.message || err));
-    hangUp();
-  }
+  setState("speaking", "Connecting…");
+  await speak("Hi, you're connected. What can I help you with today?");
+  await listenOnce();
 }
 
 function hangUp(){
   callOn = false;
   startBtn.disabled = false;
   hangBtn.disabled = true;
-  setStatus("Call ended.");
+
+  setState("", "Call ended.");
   stopTimer();
-  synth?.cancel?.();
+
+  try { synth?.cancel?.(); } catch {}
   try { rec?.stop?.(); } catch {}
-  rec = null;
-  userKey = null;
-  conversationId = null;
-  lastSeenMessageId = null;
+
+  waitingForBot = false;
+  awaitingReplyResolver = null;
+  clearTimeout(awaitingReplyTimer);
+  awaitingReplyTimer = null;
 }
 
-startBtn.onclick = () => startCall();
+startBtn.onclick = () => startCall().catch(err => {
+  console.error(err);
+  setState("", "Could not start.");
+  setDebug(String(err?.message || err));
+  hangUp();
+});
 hangBtn.onclick = hangUp;
 
 if (synth && synth.onvoiceschanged !== undefined) {
