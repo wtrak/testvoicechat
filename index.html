@@ -19,7 +19,7 @@
     button.danger { background:var(--danger); color:#fff; border-color:var(--danger); }
     button:disabled { opacity:.55; cursor:not-allowed; }
     .hint { margin-top:12px; font-size:12px; color:var(--muted); line-height:1.35; }
-    .small { font-size:12px; color:var(--muted); margin-top:8px; }
+    .small { font-size:12px; color:var(--muted); margin-top:8px; white-space:pre-wrap; }
   </style>
 </head>
 <body>
@@ -45,15 +45,13 @@
   </div>
 
 <script>
-/* ========= Botpress Chat API =========
-Docs:
-- Chat API intro & webhook ID usage :contentReference[oaicite:2]{index=2}
-- listMessages headers (x-user-key) :contentReference[oaicite:3]{index=3}
-- listenConversation SSE endpoint :contentReference[oaicite:4]{index=4}
-===================================== */
+/**
+ * Voice-only “phone call” UI + Botpress brain.
+ * Uses your Cloudflare Worker proxy (BASE) to avoid CORS issues.
+ * Uses polling to fetch bot replies (more reliable than SSE through proxies).
+ */
 
-const WEBHOOK_ID = "8ff7ce1b-b595-49b0-b8f9-5f81b287b6a7";
-const BASE = `https://winter-firefly-e33b.seanmatias1962.workers.dev/bp`;
+const BASE = "https://winter-firefly-e33b.seanmatias1962.workers.dev/bp";
 
 // UI
 const timerEl = document.getElementById("timer");
@@ -69,9 +67,17 @@ function fmtTime(ms){
   return String(m).padStart(2,'0') + ":" + String(r).padStart(2,'0');
 }
 
+// Lightweight logger (prints + shows last line in UI)
+function log(...args) {
+  try { console.log("[VOICE]", ...args); } catch {}
+  const msg = args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+  setDebug(msg);
+}
+
 let callOn=false, startedAt=null, timerInt=null;
 let userKey=null, conversationId=null;
-let abortListen=null;
+let rec = null;
+let lastSeenMessageId = null;
 
 // Browser voice
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -94,94 +100,129 @@ function speak(text){
   });
 }
 
-// --- Chat API calls ---
+// --- Chat API calls (via Worker proxy) ---
 async function createUser(){
+  log("createUser →", `${BASE}/users`);
   const res = await fetch(`${BASE}/users`, {
     method:"POST",
     headers:{ "Content-Type":"application/json" },
     body: JSON.stringify({})
   });
 
-  const text = await res.text(); // read raw text first
-  if (!res.ok) {
-    throw new Error(`createUser failed (${res.status}): ${text.slice(0,200)}`);
-  }
+  const raw = await res.text();
+  log("createUser status", res.status);
 
-  // Some APIs return empty bodies on error; guard JSON parse
-  if (!text.trim()) throw new Error("createUser returned empty body");
-  const data = JSON.parse(text);
+  if (!res.ok) throw new Error(`createUser failed (${res.status}): ${raw.slice(0,200)}`);
+  if (!raw.trim()) throw new Error("createUser returned empty body");
 
-  return data.key || data.userKey || data.user?.key;
+  const data = JSON.parse(raw);
+  const key = data.key || data.userKey || data.user?.key;
+  if (!key) throw new Error("createUser: no key returned");
+  return key;
 }
 
 async function createConversation(){
-  const res = await fetch(`${BASE}/conversations`, { method:"POST", headers:{ "Content-Type":"application/json", "x-user-key": userKey }, body: JSON.stringify({}) });
-  if(!res.ok) throw new Error("createConversation failed");
-  const data = await res.json();
-  return data.conversation?.id || data.id;
+  log("createConversation →", `${BASE}/conversations`);
+  const res = await fetch(`${BASE}/conversations`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json", "x-user-key": userKey },
+    body: JSON.stringify({})
+  });
+
+  const raw = await res.text();
+  log("createConversation status", res.status);
+
+  if (!res.ok) throw new Error(`createConversation failed (${res.status}): ${raw.slice(0,200)}`);
+  if (!raw.trim()) throw new Error("createConversation returned empty body");
+
+  const data = JSON.parse(raw);
+  const id = data.conversation?.id || data.id;
+  if (!id) throw new Error("createConversation: no conversation id returned");
+  return id;
 }
 
 async function sendMessage(text){
+  log("sendMessage →", text);
   const res = await fetch(`${BASE}/messages`, {
     method:"POST",
     headers:{ "Content-Type":"application/json", "x-user-key": userKey },
     body: JSON.stringify({ conversationId, payload:{ type:"text", text } })
   });
-  if(!res.ok) throw new Error("sendMessage failed");
+
+  const raw = await res.text();
+  log("sendMessage status", res.status);
+
+  if(!res.ok) throw new Error(`sendMessage failed (${res.status}): ${raw.slice(0,200)}`);
 }
 
-// --- Live listening (SSE) using fetch streaming, so we CAN send x-user-key header ---
-async function listenConversation(onBotText){
-  // Docs endpoint: GET /conversations/{id}/listen :contentReference[oaicite:5]{index=5}
-  const ctrl = new AbortController();
-  abortListen = () => ctrl.abort();
+async function listMessages(){
+  const url = `${BASE}/messages?conversationId=${encodeURIComponent(conversationId)}`;
+  const res = await fetch(url, { method:"GET", headers:{ "x-user-key": userKey } });
 
-  const res = await fetch(`${BASE}/conversations/${encodeURIComponent(conversationId)}/listen`, {
-    method: "GET",
-    headers: { "x-user-key": userKey },
-    signal: ctrl.signal
-  });
-  if(!res.ok) throw new Error("listenConversation failed");
+  const raw = await res.text();
+  if (!res.ok) throw new Error(`listMessages failed (${res.status}): ${raw.slice(0,200)}`);
+  if (!raw.trim()) return [];
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buf = "";
+  const data = JSON.parse(raw);
+  const msgs = data.messages || data.items || data;
+  return Array.isArray(msgs) ? msgs : [];
+}
 
-  while(callOn){
-    const { value, done } = await reader.read();
-    if(done) break;
-    buf += decoder.decode(value, { stream:true });
+function normalizeMessage(m) {
+  const id = m.id || m.message?.id || null;
+  const direction = (m.direction || m.message?.direction || "").toLowerCase();
+  const payload = m.payload || m.message?.payload || {};
+  const text = payload.text || payload?.message?.text || null;
+  const createdAt = m.createdAt || m.message?.createdAt || 0;
+  return { id, direction, text, createdAt };
+}
 
-    // Parse SSE frames separated by blank line
-    const frames = buf.split("\n\n");
-    buf = frames.pop() || "";
+async function primeLastSeen(){
+  try {
+    const msgs = await listMessages();
+    if (!msgs.length) return;
+    const ordered = msgs.map(normalizeMessage).sort((a,b)=> (a.createdAt||0)-(b.createdAt||0));
+    const last = ordered[ordered.length - 1];
+    lastSeenMessageId = last?.id || null;
+  } catch {}
+}
 
-    for(const frame of frames){
-      // SSE payload often contains "data: {json}"
-      const dataLine = frame.split("\n").find(l => l.startsWith("data:"));
-      if(!dataLine) continue;
-      const jsonStr = dataLine.replace(/^data:\s?/, "").trim();
-      if(!jsonStr) continue;
+async function waitForBotReply(timeoutMs = 15000) {
+  const start = Date.now();
 
-      try{
-        const evt = JSON.parse(jsonStr);
-        const text = evt?.message?.payload?.text || evt?.payload?.text;
-        const direction = evt?.message?.direction || evt?.direction; // usually incoming/outgoing
-        const isBot = direction === "outgoing";
-        if(isBot && typeof text === "string" && text.trim()){
-          onBotText(text.trim());
-        }
-      } catch {}
+  while (Date.now() - start < timeoutMs && callOn) {
+    const msgsRaw = await listMessages();
+    const msgs = msgsRaw.map(normalizeMessage);
+
+    // oldest -> newest
+    msgs.sort((a,b)=> (a.createdAt||0) - (b.createdAt||0));
+
+    // newest outgoing not yet spoken
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (!m.id || !m.text) continue;
+
+      const isBot = m.direction === "outgoing";
+      const isNew = lastSeenMessageId !== m.id;
+
+      if (isBot && isNew) {
+        lastSeenMessageId = m.id;
+        return String(m.text).trim();
+      }
     }
+
+    await new Promise(r => setTimeout(r, 700));
   }
+  return null;
 }
 
-// --- Hands-free mic loop (listen, send, wait for bot, repeat) ---
-let rec = null;
-let waitingForBot = false;
-
+// --- One-turn mic listen (then we speak, then listen again) ---
 function listenOnce(){
-  if(!canSTT){ setStatus("Voice input not supported. Use Chrome/Edge."); return; }
+  if(!canSTT){
+    setStatus("Voice input not supported. Use Chrome/Edge.");
+    return;
+  }
+
   synth?.cancel?.(); // barge-in friendly
 
   rec = new SpeechRecognition();
@@ -194,10 +235,31 @@ function listenOnce(){
   rec.onresult = async (e) => {
     const text = e.results[0][0].transcript.trim();
     if(!text) return;
-    setStatus("Thinking…");
-    waitingForBot = true;
-    await sendMessage(text);
-    // we restart listening after bot speaks (see onBotText handler)
+
+    try {
+      setStatus("Thinking…");
+      await sendMessage(text);
+
+      const reply = await waitForBotReply();
+      if (reply) {
+        const trimmed = reply.replace(/\s+/g," ").slice(0, 500);
+        setStatus("Speaking…");
+        await speak(trimmed);
+      } else {
+        setStatus("No response. Try again.");
+        await speak("Sorry, I didn't get a response. Please try again.");
+      }
+    } catch (err) {
+      console.error(err);
+      setStatus("Connection issue.");
+      setDebug(String(err?.message || err));
+      await speak("Sorry, there was a connection issue.");
+    } finally {
+      if (callOn) {
+        setStatus("Listening…");
+        listenOnce();
+      }
+    }
   };
 
   rec.onerror = async () => {
@@ -205,7 +267,7 @@ function listenOnce(){
     if(callOn) setTimeout(listenOnce, 450);
   };
 
-  rec.onend = () => { /* we'll restart after bot reply */ };
+  rec.onend = () => { /* loop controlled by finally */ };
 
   rec.start();
 }
@@ -225,32 +287,20 @@ async function startCall(){
   setDebug("");
   startTimer();
 
-  setStatus("Connecting…");
-  userKey = await createUser();
-  conversationId = await createConversation();
+  try {
+    setStatus("Connecting…");
+    userKey = await createUser();
+    conversationId = await createConversation();
+    await primeLastSeen();
 
-  // Start listening stream first
-  listenConversation(async (botText) => {
-    // Keep it “call-like”
-    const trimmed = botText.replace(/\s+/g," ").slice(0, 500);
-
-    setStatus("Speaking…");
-    await speak(trimmed);
-
-    // Loop back to listening after bot finishes
-    if(callOn){
-      setStatus("Listening…");
-      waitingForBot = false;
-      listenOnce();
-    }
-  }).catch(err=>{
+    await speak("Hi, you're connected. What can I help you with today?");
+    listenOnce();
+  } catch (err) {
     console.error(err);
-    setDebug("Listen stream error. Check console.");
-    setStatus("Connection issue.");
-  });
-
-  await speak("Hi, you're connected. What can I help you with today?");
-  listenOnce();
+    setStatus("Could not connect.");
+    setDebug(String(err?.message || err));
+    hangUp();
+  }
 }
 
 function hangUp(){
@@ -261,18 +311,13 @@ function hangUp(){
   stopTimer();
   synth?.cancel?.();
   try { rec?.stop?.(); } catch {}
-  try { abortListen?.(); } catch {}
-  abortListen = null;
+  rec = null;
   userKey = null;
   conversationId = null;
+  lastSeenMessageId = null;
 }
 
-startBtn.onclick = () => startCall().catch(err=>{
-  console.error(err);
-  setStatus("Could not connect. Check webhook ID.");
-  setDebug(String(err?.message || err));
-  hangUp();
-});
+startBtn.onclick = () => startCall();
 hangBtn.onclick = hangUp;
 
 if (synth && synth.onvoiceschanged !== undefined) {
