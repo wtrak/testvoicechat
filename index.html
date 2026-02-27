@@ -103,22 +103,39 @@ function speak(text){
 // --- Chat API calls (via Worker proxy) ---
 async function createUser(){
   log("createUser →", `${BASE}/users`);
+
   const res = await fetch(`${BASE}/users`, {
     method:"POST",
     headers:{ "Content-Type":"application/json" },
     body: JSON.stringify({})
   });
 
-  const raw = await res.text();
   log("createUser status", res.status);
 
+  // Try body first
+  const raw = await res.text();
   if (!res.ok) throw new Error(`createUser failed (${res.status}): ${raw.slice(0,200)}`);
-  if (!raw.trim()) throw new Error("createUser returned empty body");
 
-  const data = JSON.parse(raw);
-  const key = data.key || data.userKey || data.user?.key;
-  if (!key) throw new Error("createUser: no key returned");
-  return key;
+  if (raw.trim()) {
+    const data = JSON.parse(raw);
+    const key = data.key || data.userKey || data.user?.key || data.user?.id || data.id;
+    if (key) return key;
+  }
+
+  // Fallback: try headers
+  const headerKey =
+    res.headers.get("x-user-key") ||
+    res.headers.get("X-User-Key") ||
+    res.headers.get("bp-user-key") ||
+    res.headers.get("BP-User-Key");
+
+  if (headerKey) return headerKey;
+
+  // If still nothing, show headers to debug
+  const headersObj = {};
+  for (const [k,v] of res.headers.entries()) headersObj[k] = v;
+  setDebug("createUser empty body; headers: " + JSON.stringify(headersObj, null, 2));
+  throw new Error("createUser: no key returned (body empty; no header key)");
 }
 
 async function createConversation(){
