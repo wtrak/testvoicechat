@@ -64,8 +64,8 @@
       </div>
 
       <div class="hint">
-        Best in Chrome/Edge. Mic requires HTTPS (GitHub Pages is HTTPS). This uses Botpress Webchat hidden in the background
-        and speaks responses aloud. If replies feel slow, that’s model latency—this UI shows “Thinking…” while waiting.
+        Best in Chrome/Edge. Mic requires HTTPS (GitHub Pages is HTTPS).
+        Webchat runs hidden in the background. This page only shows the phone-call UI.
       </div>
 
       <div class="small" id="debug"></div>
@@ -77,10 +77,8 @@
  *  CONFIG
  *  ======================= */
 const CONFIG_URL = "https://files.bpcontent.cloud/2026/02/27/04/20260227040015-FOQXNUVC.json";
-
-// “Feels faster” defaults
-const MAX_BOT_SPOKEN_CHARS = 700;        // keep replies short in speech
-const BOT_REPLY_TIMEOUT_MS = 30000;      // how long to wait for a reply before prompting retry
+const MAX_BOT_SPOKEN_CHARS = 700;
+const BOT_REPLY_TIMEOUT_MS = 30000;
 
 /** =======================
  *  UI helpers
@@ -123,44 +121,32 @@ function startTimer(){
 function stopTimer(){ clearInterval(timerInt); timerInt = null; }
 
 /** =======================
- *  Browser TTS (free)
+ *  Browser TTS
  *  ======================= */
 const synth = window.speechSynthesis;
 
 function pickVoice(){
   const voices = synth?.getVoices?.() || [];
-  // Prefer high-quality common voices if available
   return voices.find(v => /Google|Samantha|Daniel|Karen|Moira/i.test(v.name)) || voices[0] || null;
 }
-
-// Improves pronunciation for your use-case
 function normalizeForSpeech(t){
   if (!t) return t;
-  // Oliwia pronunciation hint: “oh-LIV-ee-ah” or “Olivia” equivalent
-  // (We can’t force exact phonemes reliably across all voices, but this helps.)
-  return t
-    .replace(/\bOliwia\b/g, "Olivia") // makes most English voices say it right
-    .replace(/\s+/g, " ")
-    .trim();
+  return t.replace(/\bOliwia\b/g, "Olivia").replace(/\s+/g, " ").trim();
 }
-
 async function speak(text){
   return new Promise(resolve => {
     if (!synth) return resolve();
     synth.cancel();
     const u = new SpeechSynthesisUtterance(normalizeForSpeech(text));
-    const v = pickVoice();
-    if (v) u.voice = v;
-    u.rate = 0.98;
-    u.pitch = 1.0;
-    u.onend = resolve;
-    u.onerror = resolve;
+    const v = pickVoice(); if (v) u.voice = v;
+    u.rate = 0.98; u.pitch = 1.0;
+    u.onend = resolve; u.onerror = resolve;
     synth.speak(u);
   });
 }
 
 /** =======================
- *  Browser STT (free)
+ *  Browser STT
  *  ======================= */
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 const canSTT = !!SpeechRecognition;
@@ -173,7 +159,6 @@ let bpReady = false;
 let waitingForBot = false;
 let lastUserUtteranceAt = 0;
 
-// We’ll treat any bot message event we can detect as “reply”
 let awaitingReplyResolver = null;
 let awaitingReplyTimer = null;
 
@@ -187,7 +172,6 @@ function waitForBotReply(){
     }, BOT_REPLY_TIMEOUT_MS);
   });
 }
-
 function resolveBotReply(text){
   if (!awaitingReplyResolver) return;
   clearTimeout(awaitingReplyTimer);
@@ -195,15 +179,8 @@ function resolveBotReply(text){
   awaitingReplyResolver = null;
   r(text);
 }
-
-/**
- * Botpress Webchat posts messages to window. The exact shape varies.
- * We aggressively extract any plausible bot text payload.
- */
 function extractBotTextFromPostMessage(evtData){
   if (!evtData || typeof evtData !== "object") return null;
-
-  // Common candidates across versions:
   const candidates = [
     evtData?.payload?.text,
     evtData?.payload?.message?.text,
@@ -211,64 +188,64 @@ function extractBotTextFromPostMessage(evtData){
     evtData?.message?.payload?.text,
     evtData?.data?.payload?.text
   ];
-
   const text = candidates.find(x => typeof x === "string" && x.trim());
   return text ? text.trim() : null;
 }
-
-/**
- * Heuristic to decide “is this likely a bot message?”
- * (Since we hide UI, we only need a reliable-ish signal.)
- */
 function isLikelyBotMessage(evtData){
   const s = JSON.stringify(evtData);
-  // Try common markers. If your bot also sends these for user, we still gate on timing.
   if (/outgoing/i.test(s)) return true;
   if (/(bot|assistant)/i.test(s)) return true;
   if (/message/i.test(s) && /payload/i.test(s)) return true;
   return false;
 }
 
-function initHiddenBotpress(){
+function tryInitBotpress(){
   if (!window.botpressWebChat) return false;
-
-  window.botpressWebChat.init({ configUrl: CONFIG_URL });
-
-  // Ensure widget stays hidden if it tries to show
-  try { window.botpressWebChat.sendEvent({ type: "hide" }); } catch {}
-
-  // Listen for webchat events via postMessage
-  window.addEventListener("message", async (event) => {
-    if (!callOn) return;
-
-    const text = extractBotTextFromPostMessage(event.data);
-    if (!text) return;
-
-    // Gate to avoid accidentally reading back our own user utterance echoes:
-    // Only accept as bot reply if:
-    // - we are currently waiting for a bot reply, AND
-    // - the message happens after the last user utterance timestamp, AND
-    // - it looks bot-ish enough
-    if (!waitingForBot) return;
-    const now = Date.now();
-    if (now - lastUserUtteranceAt < 150) return; // too fast; likely echo/noise
-
-    // If it’s not bot-ish, still allow it after a bit (some versions don’t tag well)
-    const botish = isLikelyBotMessage(event.data);
-    if (!botish && (now - lastUserUtteranceAt) < 600) return;
-
-    resolveBotReply(text);
-  });
-
-  bpReady = true;
-  log("Botpress hidden runtime ready");
-  return true;
+  try {
+    window.botpressWebChat.init({ configUrl: CONFIG_URL });
+    try { window.botpressWebChat.sendEvent({ type: "hide" }); } catch {}
+    bpReady = true;
+    log("Botpress ready");
+    return true;
+  } catch (e) {
+    console.warn(e);
+    return false;
+  }
 }
 
-// Wait for inject.js to be ready
-(function waitBP(){
-  if (initHiddenBotpress()) return;
-  setTimeout(waitBP, 200);
+async function ensureBotpressReady(maxWaitMs = 15000){
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    if (bpReady && window.botpressWebChat && typeof window.botpressWebChat.sendPayload === "function") {
+      return true;
+    }
+    // try init again if not ready yet
+    if (!bpReady) tryInitBotpress();
+    await new Promise(r => setTimeout(r, 250));
+  }
+  return false;
+}
+
+// One-time postMessage listener
+window.addEventListener("message", (event) => {
+  if (!callOn) return;
+  const text = extractBotTextFromPostMessage(event.data);
+  if (!text) return;
+  if (!waitingForBot) return;
+
+  const now = Date.now();
+  if (now - lastUserUtteranceAt < 150) return;
+
+  const botish = isLikelyBotMessage(event.data);
+  if (!botish && (now - lastUserUtteranceAt) < 600) return;
+
+  resolveBotReply(text);
+});
+
+// Kick off init attempts in background
+(function boot(){
+  tryInitBotpress();
+  setTimeout(boot, 750);
 })();
 
 /** =======================
@@ -279,8 +256,6 @@ async function listenOnce(){
     setState("", "Voice input not supported. Use Chrome/Edge.");
     return;
   }
-
-  // Barge-in: if user starts speaking, stop TTS
   try { synth?.cancel?.(); } catch {}
 
   rec = new SpeechRecognition();
@@ -292,8 +267,8 @@ async function listenOnce(){
 
   rec.onresult = async (e) => {
     const userText = (e.results?.[0]?.[0]?.transcript || "").trim();
-    if (!userText) {
-      if (callOn) setTimeout(listenOnce, 250);
+    if(!userText){
+      if (callOn) setTimeout(listenOnce, 200);
       return;
     }
 
@@ -301,13 +276,18 @@ async function listenOnce(){
       setState("thinking", "Thinking…");
       log("you →", userText);
 
+      // Ensure Botpress is ready BEFORE sending
+      const ok = await ensureBotpressReady();
+      if (!ok) {
+        setState("", "Agent not ready.");
+        throw new Error("Botpress runtime not ready (sendPayload unavailable)");
+      }
+
       lastUserUtteranceAt = Date.now();
       waitingForBot = true;
 
-      // Send text to bot
       window.botpressWebChat.sendPayload({ type: "text", text: userText });
 
-      // Wait for bot reply
       const botText = await waitForBotReply();
       waitingForBot = false;
 
@@ -325,7 +305,6 @@ async function listenOnce(){
       setState("speaking", "Speaking…");
       await speak(spoken);
 
-      // Back to listening
       if (callOn) return listenOnce();
     } catch (err) {
       console.error(err);
@@ -343,7 +322,6 @@ async function listenOnce(){
   };
 
   rec.onend = () => {
-    // If it ends without result, restart if call is still on and we're not waiting on bot
     if (callOn && !waitingForBot) setTimeout(listenOnce, 250);
   };
 
@@ -354,19 +332,24 @@ async function listenOnce(){
  *  Call controls
  *  ======================= */
 async function startCall(){
-  if (!bpReady){
-    setState("thinking", "Loading agent…");
-    await new Promise(r => setTimeout(r, 700));
-  }
-
   callOn = true;
   startBtn.disabled = true;
   hangBtn.disabled = false;
   setDebug("");
-
   startTimer();
 
-  setState("speaking", "Connecting…");
+  setState("thinking", "Connecting…");
+
+  // Make sure bot runtime is truly ready before we start STT loop
+  const ok = await ensureBotpressReady();
+  if (!ok) {
+    hangUp();
+    setState("", "Agent failed to load.");
+    setDebug("Botpress runtime not ready. Check network/adblock/extensions.");
+    return;
+  }
+
+  setState("speaking", "Connected.");
   await speak("Hi, you're connected. What can I help you with today?");
   await listenOnce();
 }
@@ -375,12 +358,12 @@ function hangUp(){
   callOn = false;
   startBtn.disabled = false;
   hangBtn.disabled = true;
-
   setState("", "Call ended.");
   stopTimer();
 
   try { synth?.cancel?.(); } catch {}
   try { rec?.stop?.(); } catch {}
+  rec = null;
 
   waitingForBot = false;
   awaitingReplyResolver = null;
