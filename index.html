@@ -17,10 +17,7 @@
     .timer{ font-size:44px; font-weight:800; letter-spacing:1px; margin:14px 0 6px; }
     .status{ color:#2b2f36; margin:0 0 10px; }
     .microw{ display:flex; align-items:center; gap:10px; margin:0 0 16px; color:var(--muted); font-size:12px; }
-    .dot{
-      width:10px; height:10px; border-radius:999px; background:#cbd5e1;
-      box-shadow:0 0 0 0 rgba(17,24,39,.25);
-    }
+    .dot{ width:10px; height:10px; border-radius:999px; background:#cbd5e1; box-shadow:0 0 0 0 rgba(17,24,39,.25); }
     .dot.listening{ background:#22c55e; animation:pulse 1.2s infinite; }
     .dot.thinking{ background:#f59e0b; animation:pulse 1.2s infinite; }
     .dot.speaking{ background:#3b82f6; animation:pulse 1.2s infinite; }
@@ -40,9 +37,6 @@
     /* Hide any Botpress webchat UI entirely */
     #bp-webchat, .bpw-widget-btn, .bpw-widget-container, .bpw-layout, .bpw-chat-container { display:none !important; }
   </style>
-
-  <!-- Botpress Webchat runtime -->
-  <script src="https://cdn.botpress.cloud/webchat/v3.6/inject.js"></script>
 </head>
 <body>
   <div class="wrap">
@@ -64,8 +58,8 @@
       </div>
 
       <div class="hint">
-        Best in Chrome/Edge. Mic requires HTTPS (GitHub Pages is HTTPS).
-        Webchat runs hidden in the background. This page only shows the phone-call UI.
+        Best in Chrome/Edge. If it says “agent failed to load”, it’s almost always an extension/adblock/shields blocking Botpress scripts.
+        Try Incognito with extensions off.
       </div>
 
       <div class="small" id="debug"></div>
@@ -77,6 +71,9 @@
  *  CONFIG
  *  ======================= */
 const CONFIG_URL = "https://files.bpcontent.cloud/2026/02/27/04/20260227040015-FOQXNUVC.json";
+const INJECT_URL = "https://cdn.botpress.cloud/webchat/v3.6/inject.js";
+const BOT_INIT_TIMEOUT_MS = 20000;
+
 const MAX_BOT_SPOKEN_CHARS = 700;
 const BOT_REPLY_TIMEOUT_MS = 30000;
 
@@ -93,7 +90,7 @@ const micLabel = document.getElementById("miclabel");
 
 function setDebug(t){ debugEl.textContent = t || ""; }
 function log(...args){
-  try { console.log("[VOICE]", ...args); } catch {}
+  console.log("[VOICE]", ...args);
   const msg = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
   setDebug(msg);
 }
@@ -110,21 +107,18 @@ function setState(state, statusText){
 /** =======================
  *  Call timer
  *  ======================= */
-let callOn = false;
-let timerInt = null;
-let startedAt = null;
+let callOn=false, timerInt=null, startedAt=null;
 function startTimer(){
   startedAt = Date.now();
   timerEl.textContent = "00:00";
-  timerInt = setInterval(() => timerEl.textContent = fmtTime(Date.now() - startedAt), 250);
+  timerInt = setInterval(()=> timerEl.textContent = fmtTime(Date.now()-startedAt), 250);
 }
-function stopTimer(){ clearInterval(timerInt); timerInt = null; }
+function stopTimer(){ clearInterval(timerInt); timerInt=null; }
 
 /** =======================
- *  Browser TTS
+ *  Browser TTS/STT
  *  ======================= */
 const synth = window.speechSynthesis;
-
 function pickVoice(){
   const voices = synth?.getVoices?.() || [];
   return voices.find(v => /Google|Samantha|Daniel|Karen|Moira/i.test(v.name)) || voices[0] || null;
@@ -133,54 +127,111 @@ function normalizeForSpeech(t){
   if (!t) return t;
   return t.replace(/\bOliwia\b/g, "Olivia").replace(/\s+/g, " ").trim();
 }
-async function speak(text){
-  return new Promise(resolve => {
-    if (!synth) return resolve();
+function speak(text){
+  return new Promise(resolve=>{
+    if(!synth) return resolve();
     synth.cancel();
     const u = new SpeechSynthesisUtterance(normalizeForSpeech(text));
-    const v = pickVoice(); if (v) u.voice = v;
+    const v = pickVoice(); if(v) u.voice = v;
     u.rate = 0.98; u.pitch = 1.0;
     u.onend = resolve; u.onerror = resolve;
     synth.speak(u);
   });
 }
-
-/** =======================
- *  Browser STT
- *  ======================= */
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 const canSTT = !!SpeechRecognition;
 let rec = null;
 
 /** =======================
- *  Botpress hidden runtime
+ *  Botpress runtime bootstrap (diagnostic)
  *  ======================= */
 let bpReady = false;
-let waitingForBot = false;
-let lastUserUtteranceAt = 0;
 
-let awaitingReplyResolver = null;
-let awaitingReplyTimer = null;
+async function loadScript(src){
+  return new Promise((resolve, reject)=>{
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve(true);
+    s.onerror = () => reject(new Error("Failed to load script: " + src));
+    document.head.appendChild(s);
+  });
+}
+
+async function probeConfigUrl(){
+  // This confirms your configUrl is reachable from the browser (not blocked)
+  const res = await fetch(CONFIG_URL, { method:"GET", cache:"no-store" });
+  if (!res.ok) throw new Error(`configUrl fetch failed (${res.status})`);
+  // Don’t parse fully; just check it’s not empty
+  const txt = await res.text();
+  if (!txt.trim()) throw new Error("configUrl returned empty body");
+  return true;
+}
+
+async function initBotpress(){
+  // Ensure config is reachable first (gives clear error if blocked)
+  setState("thinking", "Checking config…");
+  await probeConfigUrl();
+  log("configUrl OK");
+
+  setState("thinking", "Loading Botpress…");
+  await loadScript(INJECT_URL);
+  log("inject.js loaded");
+
+  const start = Date.now();
+  while (Date.now() - start < BOT_INIT_TIMEOUT_MS) {
+    const bp = window.botpressWebChat;
+    if (bp && typeof bp.init === "function") {
+      try {
+        bp.init({ configUrl: CONFIG_URL });
+        try { bp.sendEvent({ type:"hide" }); } catch {}
+        // Wait for sendPayload to exist
+        const t0 = Date.now();
+        while (Date.now() - t0 < 8000) {
+          if (window.botpressWebChat && typeof window.botpressWebChat.sendPayload === "function") {
+            bpReady = true;
+            log("Botpress ready (sendPayload OK)");
+            return true;
+          }
+          await new Promise(r=>setTimeout(r,250));
+        }
+      } catch (e) {
+        // Keep retrying until timeout
+      }
+    }
+    await new Promise(r=>setTimeout(r,250));
+  }
+  return false;
+}
+
+/** =======================
+ *  Bot reply capture (postMessage)
+ *  ======================= */
+let waitingForBot=false;
+let lastUserUtteranceAt=0;
+
+let awaitingReplyResolver=null;
+let awaitingReplyTimer=null;
 
 function waitForBotReply(){
-  return new Promise((resolve) => {
+  return new Promise((resolve)=>{
     awaitingReplyResolver = resolve;
     clearTimeout(awaitingReplyTimer);
-    awaitingReplyTimer = setTimeout(() => {
+    awaitingReplyTimer = setTimeout(()=>{
       awaitingReplyResolver = null;
       resolve(null);
     }, BOT_REPLY_TIMEOUT_MS);
   });
 }
 function resolveBotReply(text){
-  if (!awaitingReplyResolver) return;
+  if(!awaitingReplyResolver) return;
   clearTimeout(awaitingReplyTimer);
   const r = awaitingReplyResolver;
   awaitingReplyResolver = null;
   r(text);
 }
-function extractBotTextFromPostMessage(evtData){
-  if (!evtData || typeof evtData !== "object") return null;
+function extractText(evtData){
+  if(!evtData || typeof evtData !== "object") return null;
   const candidates = [
     evtData?.payload?.text,
     evtData?.payload?.message?.text,
@@ -188,74 +239,42 @@ function extractBotTextFromPostMessage(evtData){
     evtData?.message?.payload?.text,
     evtData?.data?.payload?.text
   ];
-  const text = candidates.find(x => typeof x === "string" && x.trim());
-  return text ? text.trim() : null;
+  const t = candidates.find(x => typeof x === "string" && x.trim());
+  return t ? t.trim() : null;
 }
-function isLikelyBotMessage(evtData){
+function looksBotish(evtData){
   const s = JSON.stringify(evtData);
-  if (/outgoing/i.test(s)) return true;
-  if (/(bot|assistant)/i.test(s)) return true;
-  if (/message/i.test(s) && /payload/i.test(s)) return true;
+  if(/outgoing/i.test(s)) return true;
+  if(/(bot|assistant)/i.test(s)) return true;
+  if(/message/i.test(s) && /payload/i.test(s)) return true;
   return false;
 }
 
-function tryInitBotpress(){
-  if (!window.botpressWebChat) return false;
-  try {
-    window.botpressWebChat.init({ configUrl: CONFIG_URL });
-    try { window.botpressWebChat.sendEvent({ type: "hide" }); } catch {}
-    bpReady = true;
-    log("Botpress ready");
-    return true;
-  } catch (e) {
-    console.warn(e);
-    return false;
-  }
-}
+window.addEventListener("message", (event)=>{
+  if(!callOn) return;
+  if(!waitingForBot) return;
 
-async function ensureBotpressReady(maxWaitMs = 15000){
-  const start = Date.now();
-  while (Date.now() - start < maxWaitMs) {
-    if (bpReady && window.botpressWebChat && typeof window.botpressWebChat.sendPayload === "function") {
-      return true;
-    }
-    // try init again if not ready yet
-    if (!bpReady) tryInitBotpress();
-    await new Promise(r => setTimeout(r, 250));
-  }
-  return false;
-}
-
-// One-time postMessage listener
-window.addEventListener("message", (event) => {
-  if (!callOn) return;
-  const text = extractBotTextFromPostMessage(event.data);
-  if (!text) return;
-  if (!waitingForBot) return;
+  const text = extractText(event.data);
+  if(!text) return;
 
   const now = Date.now();
-  if (now - lastUserUtteranceAt < 150) return;
+  if(now - lastUserUtteranceAt < 150) return;
 
-  const botish = isLikelyBotMessage(event.data);
-  if (!botish && (now - lastUserUtteranceAt) < 600) return;
+  const botish = looksBotish(event.data);
+  if(!botish && (now - lastUserUtteranceAt) < 600) return;
 
   resolveBotReply(text);
 });
-
-// Kick off init attempts in background
-(function boot(){
-  tryInitBotpress();
-  setTimeout(boot, 750);
-})();
 
 /** =======================
  *  Voice loop
  *  ======================= */
 async function listenOnce(){
-  if (!canSTT){
+  if(!canSTT){
     setState("", "Voice input not supported. Use Chrome/Edge.");
     return;
   }
+
   try { synth?.cancel?.(); } catch {}
 
   rec = new SpeechRecognition();
@@ -263,66 +282,59 @@ async function listenOnce(){
   rec.interimResults = false;
   rec.maxAlternatives = 1;
 
-  setState("listening", "Listening…");
+  setState("listening","Listening…");
 
-  rec.onresult = async (e) => {
+  rec.onresult = async (e)=>{
     const userText = (e.results?.[0]?.[0]?.transcript || "").trim();
     if(!userText){
-      if (callOn) setTimeout(listenOnce, 200);
+      if(callOn) setTimeout(listenOnce,200);
       return;
     }
 
-    try {
-      setState("thinking", "Thinking…");
+    try{
+      setState("thinking","Thinking…");
       log("you →", userText);
-
-      // Ensure Botpress is ready BEFORE sending
-      const ok = await ensureBotpressReady();
-      if (!ok) {
-        setState("", "Agent not ready.");
-        throw new Error("Botpress runtime not ready (sendPayload unavailable)");
-      }
 
       lastUserUtteranceAt = Date.now();
       waitingForBot = true;
 
-      window.botpressWebChat.sendPayload({ type: "text", text: userText });
+      window.botpressWebChat.sendPayload({ type:"text", text:userText });
 
       const botText = await waitForBotReply();
       waitingForBot = false;
 
-      if (!callOn) return;
+      if(!callOn) return;
 
-      if (!botText) {
+      if(!botText){
         setState("", "No response. Try again.");
         await speak("Sorry, I didn’t get a response. Please try again.");
         return listenOnce();
       }
 
-      const spoken = botText.replace(/\s+/g, " ").trim().slice(0, MAX_BOT_SPOKEN_CHARS);
+      const spoken = botText.replace(/\s+/g," ").trim().slice(0, MAX_BOT_SPOKEN_CHARS);
       log("bot →", spoken);
 
-      setState("speaking", "Speaking…");
+      setState("speaking","Speaking…");
       await speak(spoken);
 
-      if (callOn) return listenOnce();
-    } catch (err) {
+      if(callOn) return listenOnce();
+    } catch(err){
       console.error(err);
       waitingForBot = false;
       setState("", "Connection issue.");
       setDebug(String(err?.message || err));
       await speak("Sorry, there was a connection issue.");
-      if (callOn) return listenOnce();
+      if(callOn) return listenOnce();
     }
   };
 
-  rec.onerror = () => {
+  rec.onerror = ()=>{
     setState("", "Didn’t catch that. Try again.");
-    if (callOn) setTimeout(listenOnce, 400);
+    if(callOn) setTimeout(listenOnce,400);
   };
 
-  rec.onend = () => {
-    if (callOn && !waitingForBot) setTimeout(listenOnce, 250);
+  rec.onend = ()=>{
+    if(callOn && !waitingForBot) setTimeout(listenOnce,250);
   };
 
   rec.start();
@@ -338,18 +350,27 @@ async function startCall(){
   setDebug("");
   startTimer();
 
-  setState("thinking", "Connecting…");
+  setState("thinking","Loading agent…");
 
-  // Make sure bot runtime is truly ready before we start STT loop
-  const ok = await ensureBotpressReady();
-  if (!ok) {
-    hangUp();
-    setState("", "Agent failed to load.");
-    setDebug("Botpress runtime not ready. Check network/adblock/extensions.");
-    return;
+  // One-time init
+  if(!bpReady){
+    try{
+      const ok = await initBotpress();
+      if(!ok){
+        hangUp();
+        setState("", "Agent failed to load.");
+        setDebug("Likely blocked: Botpress CDN or configUrl. Try Incognito with extensions off.");
+        return;
+      }
+    } catch(e){
+      hangUp();
+      setState("", "Agent failed to load.");
+      setDebug(String(e?.message || e));
+      return;
+    }
   }
 
-  setState("speaking", "Connected.");
+  setState("speaking","Connected.");
   await speak("Hi, you're connected. What can I help you with today?");
   await listenOnce();
 }
@@ -358,6 +379,7 @@ function hangUp(){
   callOn = false;
   startBtn.disabled = false;
   hangBtn.disabled = true;
+
   setState("", "Call ended.");
   stopTimer();
 
@@ -371,17 +393,15 @@ function hangUp(){
   awaitingReplyTimer = null;
 }
 
-startBtn.onclick = () => startCall().catch(err => {
+startBtn.onclick = ()=> startCall().catch(err=>{
   console.error(err);
+  hangUp();
   setState("", "Could not start.");
   setDebug(String(err?.message || err));
-  hangUp();
 });
 hangBtn.onclick = hangUp;
 
-if (synth && synth.onvoiceschanged !== undefined) {
-  synth.onvoiceschanged = () => pickVoice();
-}
+if (synth && synth.onvoiceschanged !== undefined) synth.onvoiceschanged = ()=> pickVoice();
 </script>
 </body>
 </html>
